@@ -14,14 +14,14 @@
  * limitations under the License.
  */
 
-import React, { FC, useEffect, useState } from "react"
+import React, { FC, useCallback, useEffect, useState } from "react"
 
 import { DeckGL } from "@deck.gl/react/typed"
 import { MapContext, NavigationControl, StaticMap } from "react-map-gl"
 import { CSVLoader } from "@loaders.gl/csv"
 import { GLTFLoader } from "@loaders.gl/gltf"
 import { registerLoaders } from "@loaders.gl/core"
-import { LayersList } from "@deck.gl/core/typed"
+import { LayersList, PickingInfo } from "@deck.gl/core/typed"
 import { useTheme } from "@emotion/react"
 
 import {
@@ -29,13 +29,15 @@ import {
   hasLightBackgroundColor,
 } from "@streamlit/lib/src/theme"
 import { withFullScreenWrapper } from "@streamlit/lib/src/components/shared/FullScreenWrapper"
+import { DeckGlJsonChart as DeckGlJsonChartProto } from "@streamlit/lib/src/proto"
+import { assertNever } from "@streamlit/lib/src/util/assertNever"
 
 import withMapboxToken from "./withMapboxToken"
 import {
   StyledDeckGlChart,
   StyledNavigationControlContainer,
 } from "./styled-components"
-import type { PropsWithHeight } from "./types"
+import type { DeckGlElementState, DeckGLProps, LayerSelection } from "./types"
 import { useDeckGl } from "./useDeckGl"
 
 import "mapbox-gl/dist/mapbox-gl.css"
@@ -44,15 +46,35 @@ registerLoaders([CSVLoader, GLTFLoader])
 
 const EMPTY_LAYERS: LayersList = []
 
-export const DeckGlJsonChart: FC<PropsWithHeight> = props => {
-  const { element, height, isFullScreen, width } = props
-  const theme: EmotionTheme = useTheme()
-  const { createTooltip, deck, onViewStateChange, viewState } = useDeckGl({
+export const DeckGlJsonChart: FC<DeckGLProps> = props => {
+  const {
+    disabled,
     element,
-    isLightTheme: hasLightBackgroundColor(theme),
-    width,
+    fragmentId,
     height,
     isFullScreen,
+    mapboxToken: propsMapboxToken,
+    width,
+    widgetMgr,
+  } = props
+  const { selectionMode, mapboxToken: elementMapboxToken } = element
+  const theme: EmotionTheme = useTheme()
+  const {
+    createTooltip,
+    deck,
+    onViewStateChange,
+    data: selection,
+    setSelection,
+    viewState,
+  } = useDeckGl({
+    element,
+    fragmentId,
+    height,
+    isFullScreen,
+    isLightTheme: hasLightBackgroundColor(theme),
+    theme,
+    widgetMgr,
+    width,
   })
 
   const [isInitialized, setIsInitialized] = useState(false)
@@ -63,6 +85,109 @@ export const DeckGlJsonChart: FC<PropsWithHeight> = props => {
     // script got re-executed.
     setIsInitialized(true)
   }, [])
+
+  const handleClick = useCallback(
+    (
+      info: PickingInfo,
+      event: { srcEvent: MouseEvent | TouchEvent | PointerEvent }
+    ) => {
+      if (disabled) {
+        return
+      }
+
+      const {
+        color,
+        index,
+        picked,
+        x,
+        y,
+        pixel,
+        coordinate,
+        devicePixel,
+        pixelRatio,
+        object,
+      } = info
+
+      const layerId = `${info.layer?.id || null}`
+      const currState = selection
+
+      const lastSelection: LayerSelection["last_selection"] = {
+        color,
+        layer: layerId,
+        index,
+        picked,
+        x,
+        y,
+        pixel,
+        coordinate,
+        devicePixel,
+        pixelRatio,
+        object,
+      }
+
+      const getSelection = (): DeckGlElementState["selection"] => {
+        switch (selectionMode) {
+          case DeckGlJsonChartProto.SelectionMode.IGNORE:
+            return {}
+          case DeckGlJsonChartProto.SelectionMode.SINGLE: {
+            const indices = index !== -1 ? [index] : []
+            const objects = index !== -1 ? [object] : []
+
+            return {
+              [`${layerId}`]: {
+                last_selection: lastSelection,
+                indices,
+                objects,
+              },
+            }
+          }
+          case DeckGlJsonChartProto.SelectionMode.MULTI: {
+            const wasShiftClick = event.srcEvent.shiftKey
+
+            const indices: number[] = wasShiftClick
+              ? currState?.selection?.[layerId]?.indices || []
+              : []
+
+            const objects: unknown[] = wasShiftClick
+              ? currState?.selection?.[layerId]?.objects || []
+              : []
+
+            const existingIndex = indices.indexOf(index)
+
+            if (wasShiftClick && existingIndex !== -1) {
+              // Unselect an existing index
+              indices.splice(existingIndex, 1)
+              objects.splice(existingIndex, 1)
+            }
+
+            if (index !== -1) {
+              // Add the newly selected index
+              indices.push(index)
+              objects.push(object)
+            }
+
+            return {
+              ...(wasShiftClick ? currState?.selection : {}),
+              [`${layerId}`]: {
+                last_selection: lastSelection,
+                indices,
+                objects,
+              },
+            }
+          }
+          default:
+            assertNever(selectionMode)
+            throw new Error("Invalid selection mode")
+        }
+      }
+
+      setSelection({
+        fromUi: true,
+        value: { selection: getSelection() },
+      })
+    },
+    [disabled, selectionMode, selection, setSelection]
+  )
 
   return (
     <StyledDeckGlChart
@@ -81,6 +206,7 @@ export const DeckGlJsonChart: FC<PropsWithHeight> = props => {
         // @ts-expect-error There is a type mismatch due to our versions of the libraries
         ContextProvider={MapContext.Provider}
         controller
+        onClick={typeof selectionMode === "number" ? handleClick : undefined}
       >
         <StaticMap
           height={deck.initialViewState.height}
@@ -91,7 +217,7 @@ export const DeckGlJsonChart: FC<PropsWithHeight> = props => {
               ? deck.mapStyle
               : deck.mapStyle[0])
           }
-          mapboxApiAccessToken={props.element.mapboxToken || props.mapboxToken}
+          mapboxApiAccessToken={elementMapboxToken || propsMapboxToken}
         />
         <StyledNavigationControlContainer>
           <NavigationControl
